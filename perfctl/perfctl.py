@@ -7,6 +7,7 @@ program dies the fans keep following the last curve. Nothing is persisted.
 """
 
 import argparse
+import contextlib
 import glob
 import os
 import sys
@@ -66,17 +67,30 @@ def _find_cooler():
     raise RuntimeError('no supported cooler found')
 
 
+@contextlib.contextmanager
+def _cooler():
+    """Connected cooler. On Linux, liquidctl's PyUSB backend never frees the
+    USB handle on disconnect, leaking one fd per connection; free it here."""
+    dev = _find_cooler()
+    try:
+        with dev.connect():
+            yield dev
+    finally:
+        usbdev = getattr(dev.device, 'usbdev', None)
+        if usbdev is not None:
+            import usb.util
+            usb.util.dispose_resources(usbdev)
+
+
 def get_cooler_status():
     """Dict of cooler status, e.g. {'Liquid temperature': 32.6, ...}."""
-    dev = _find_cooler()
-    with dev.connect():
+    with _cooler() as dev:
         return {key: value for key, value, _unit in dev.get_status()}
 
 
 def set_fan_boost(floor):
     """Upload the normal curve raised to floor % (0 = normal curve)."""
-    dev = _find_cooler()
-    with dev.connect():
+    with _cooler() as dev:
         # initialize() also sets pump mode; keep the current one.
         status = {key: value for key, value, _unit in dev.get_status()}
         dev.initialize(pump_mode=status.get('Pump mode', 'balanced'))
