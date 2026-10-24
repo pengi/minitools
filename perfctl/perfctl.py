@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""perfctl - tray icon and CLI for CPU cooler fan boost and CPU freq boost.
+"""perfctl - tray icon and CLI for CPU cooler fan/pump boost and CPU freq boost.
 
 Passive by design: setting the fans uploads a curve to the cooler hardware,
 which then runs it on its own. Nothing here runs a control loop, so if this
@@ -18,6 +18,9 @@ CPU_BOOST_PATH = '/sys/devices/system/cpu/cpufreq/boost'
 # increasing, interpolated in hardware. At most 6 points; liquidctl pads
 # with (60 °C, 100 %) as a failsafe.
 NORMAL_CURVE = [(20, 25), (30, 30), (33, 40), (36, 55), (39, 75), (42, 100)]
+
+# Pump speed modes supported by the cooler hardware, slowest first.
+PUMP_MODES = ['quiet', 'balanced', 'performance']
 
 ICON_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'icons')
 POLL_SECONDS = 3
@@ -97,6 +100,14 @@ def set_fan_boost(floor):
         dev.set_speed_profile('fan', boosted_curve(floor))
 
 
+def set_pump_mode(mode):
+    """Set the pump speed mode, one of PUMP_MODES. Leaves the fan curve as is."""
+    if mode not in PUMP_MODES:
+        raise ValueError(f'unknown pump mode {mode!r}')
+    with _cooler() as dev:
+        dev.initialize(pump_mode=mode)
+
+
 # --- Tray --------------------------------------------------------------------
 
 def run_tray():
@@ -110,6 +121,8 @@ def run_tray():
         def __init__(self):
             self.fan_floor = None  # unknown until set by us
             self.pending_floor = None
+            self.pump_mode = None
+            self.updating = False  # set while refresh() syncs widgets
 
             self.icon = XApp.StatusIcon()
             self.icon.set_name('perfctl')
@@ -152,14 +165,27 @@ def run_tray():
             self.scale.connect('value-changed', self.on_scale_changed)
             grid.attach(self.scale, 0, 1, 2, 1)
 
-            grid.attach(Gtk.Label(label='CPU frequency boost', xalign=0), 0, 2, 1, 1)
+            grid.attach(Gtk.Label(label='Pump', xalign=0), 0, 2, 2, 1)
+            pump_box = Gtk.Box(homogeneous=True)
+            pump_box.get_style_context().add_class('linked')
+            self.pump_buttons = {}
+            group = None
+            for mode in PUMP_MODES:
+                button = Gtk.RadioButton(label=mode, group=group, draw_indicator=False)
+                group = group or button
+                button.connect('toggled', self.on_pump_toggled, mode)
+                pump_box.add(button)
+                self.pump_buttons[mode] = button
+            grid.attach(pump_box, 0, 3, 2, 1)
+
+            grid.attach(Gtk.Label(label='CPU frequency boost', xalign=0), 0, 4, 1, 1)
             self.boost_switch = Gtk.Switch(halign=Gtk.Align.END)
             self.boost_handler = self.boost_switch.connect('notify::active', self.on_boost_toggled)
-            grid.attach(self.boost_switch, 1, 2, 1, 1)
+            grid.attach(self.boost_switch, 1, 4, 1, 1)
 
             self.status_label = Gtk.Label(xalign=0)
             self.status_label.get_style_context().add_class('dim-label')
-            grid.attach(self.status_label, 0, 3, 2, 1)
+            grid.attach(self.status_label, 0, 5, 2, 1)
 
             grid.show_all()
             self.popup = win
@@ -190,6 +216,15 @@ def run_tray():
             self.refresh()
             return False
 
+        def on_pump_toggled(self, button, mode):
+            if self.updating or not button.get_active():
+                return
+            try:
+                set_pump_mode(mode)
+            except Exception as e:
+                self.error(f'Pump: {e}')
+            self.refresh()
+
         def on_boost_toggled(self, switch, _param):
             try:
                 set_cpu_boost(switch.get_active())
@@ -216,8 +251,13 @@ def run_tray():
             try:
                 status = get_cooler_status()
                 fans = [v for k, v in status.items() if k.startswith('Fan')]
+                self.pump_mode = status['Pump mode']
                 lines.append(f"Liquid {status['Liquid temperature']:.1f} °C, "
                              f"fans {', '.join(str(int(f)) for f in fans)} rpm")
+                lines.append(f"Pump {status['Pump speed']} rpm ({self.pump_mode})")
+                self.updating = True
+                self.pump_buttons[self.pump_mode].set_active(True)
+                self.updating = False
             except Exception as e:
                 lines.append(f'Cooler: {e}')
             cpu_temp = get_cpu_temp()
@@ -235,7 +275,7 @@ def run_tray():
                 self.update_fan_label(self.fan_floor)
             self.status_label.set_text('\n'.join(lines))
 
-            boosted = bool(self.fan_floor)
+            boosted = bool(self.fan_floor) or self.pump_mode == 'performance'
             self.icon.set_icon_name(os.path.join(
                 ICON_DIR, 'perfctl-boost.svg' if boosted else 'perfctl-normal.svg'))
             self.icon.set_tooltip_text('perfctl\n' + '\n'.join(lines))
@@ -253,6 +293,8 @@ def main():
     sub.add_parser('status', help='show cooler and CPU boost status')
     fan = sub.add_parser('fan', help='set fan boost: minimum duty %%, 0 = normal curve')
     fan.add_argument('floor', type=int)
+    pump = sub.add_parser('pump', help='set pump speed mode')
+    pump.add_argument('mode', choices=PUMP_MODES)
     boost = sub.add_parser('cpuboost', help='enable/disable CPU frequency boost')
     boost.add_argument('state', choices=['on', 'off'])
     sub.add_parser('tray', help='run the tray icon')
@@ -266,6 +308,8 @@ def main():
     elif args.cmd == 'fan':
         set_fan_boost(args.floor)
         print('Fan curve:', ' '.join(f'{t}°C:{d}%' for t, d in boosted_curve(args.floor)))
+    elif args.cmd == 'pump':
+        set_pump_mode(args.mode)
     elif args.cmd == 'cpuboost':
         set_cpu_boost(args.state == 'on')
     elif args.cmd == 'tray':
